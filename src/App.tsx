@@ -1,15 +1,18 @@
-import { useEffect, useState } from "react"
-import type { Material, Sentence } from "./materials"
+import { useEffect, useRef, useState } from "react"
+import type { ReactNode } from "react"
+import type { Material, Report, Sentence } from "./materials"
 import { getMaterial, materials } from "./materials"
 import { Duck } from "./duck"
 import { useRecorder } from "./useRecorder"
 import {
   Badge,
   EditNote,
+  PremiseChecklist,
   Recording,
   SentenceList,
   SourceDrawer,
   TopBar,
+  VoiceMeter,
   focusSentence,
   formatTime,
 } from "./ui"
@@ -22,6 +25,7 @@ type Route =
   | { name: "transcript"; id: string }
   | { name: "feedback"; id: string }
   | { name: "compare"; id: string }
+  | { name: "report"; id: string; attempt: 1 | 2 }
   | { name: "done"; id: string }
   | { name: "missing" }
 
@@ -47,12 +51,16 @@ function parseRoute(hash: string): Route {
   if (parts[0] === "transcript" && parts[1]) return { name: "transcript", id: parts[1] }
   if (parts[0] === "feedback" && parts[1]) return { name: "feedback", id: parts[1] }
   if (parts[0] === "compare" && parts[1]) return { name: "compare", id: parts[1] }
+  if (parts[0] === "report" && parts[1]) {
+    return { name: "report", id: parts[1], attempt: parts[2] === "2" ? 2 : 1 }
+  }
   if (parts[0] === "done" && parts[1]) return { name: "done", id: parts[1] }
   return { name: "missing" }
 }
 
 function routeKey(route: Route): string {
   if (route.name === "speak") return `speak-${route.id}-${route.attempt}`
+  if (route.name === "report") return `report-${route.id}-${route.attempt}`
   if ("id" in route) return `${route.name}-${route.id}`
   return route.name
 }
@@ -103,6 +111,7 @@ export default function App() {
       transcript: "示例逐字稿 · 表达训练工作台",
       feedback: "示例反馈 · 表达训练工作台",
       compare: "两遍放在一起 · 表达训练工作台",
+      report: "示例报告 · 表达训练工作台",
       done: "这次就到这里 · 表达训练工作台",
       missing: "表达训练工作台",
     }
@@ -214,6 +223,8 @@ export default function App() {
         bucket={bucketFor(material)}
         onChange={(attempt, index, text) => setText(material.id, attempt, index, text)}
       />
+    ) : route.name === "report" && material ? (
+      <ReportPage material={material} attempt={route.attempt} bucket={bucketFor(material)} />
     ) : route.name === "done" && material ? (
       <Done material={material} />
     ) : (
@@ -273,7 +284,7 @@ function Pick() {
           ← 返回工作台
         </a>
         <h1>选一篇材料</h1>
-        <p className="lede">三篇都很短。用自己的话讲，大约一分钟。</p>
+        <p className="lede">三篇都很短。每篇都有一个要讲给谁听的情境。用自己的话讲，大约一分钟。</p>
         <div className="work-list">
           {materials.map((item) => (
             <a className="pick-row" href={`#/read/${item.id}`} key={item.id}>
@@ -310,12 +321,13 @@ function Read({ material, onStart }: { material: Material; onStart: () => void }
         </article>
         <section className="task">
           <h2>怎么讲</h2>
-          <p>用自己的话，把这件事讲给一个没看过材料的人听。不要背原文，也不必照着原文顺序讲。</p>
+          <p className="context-line">{material.context}</p>
+          <p>用自己的话讲。不要背原文，也不必照着原文顺序讲。</p>
         </section>
         <div className="listener">
           <Duck size={72} pose="attentive" />
           <p>
-            <strong>讲给小黄鸭听。</strong>
+            <strong>小黄鸭这回是{material.listener}。</strong>
             它没看过这篇材料，你要讲到它能听懂。
           </p>
         </div>
@@ -327,6 +339,12 @@ function Read({ material, onStart }: { material: Material; onStart: () => void }
   )
 }
 
+function speakPose(hearing: boolean, live: boolean): "attentive" | "listening" | "tilted" {
+  if (hearing) return "listening"
+  if (live) return "tilted"
+  return "attentive"
+}
+
 function Speak({
   material,
   attempt,
@@ -336,19 +354,50 @@ function Speak({
   attempt: 1 | 2
   onFinish: (url: string | null) => void
 }) {
-  const { phase, elapsed, micNote, start, stop } = useRecorder()
+  const { phase, elapsed, micNote, demoMode, bands, hearing, heardVoice, startCheck, start, stop } =
+    useRecorder()
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [recalling, setRecalling] = useState(false)
+  const [stage, setStage] = useState<"check" | "idle" | "live">(attempt === 1 ? "check" : "idle")
+  const cancelled = useRef(false)
+
+  useEffect(() => {
+    cancelled.current = false
+    if (attempt === 1) void startCheck()
+    return () => {
+      cancelled.current = true
+    }
+    // Mount-only: start the mic check once when entering the first take.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const recording = phase === "recording"
+  const live = stage === "live" || recording
+  const checking = stage === "check" && !recalling
+  const speakPhase = recalling ? "recalling" : checking ? "check" : recording ? "speak" : "idle"
+  const duckPose = recalling ? "attentive" : speakPose(hearing, live || checking)
+
+  async function beginSpeak() {
+    if (busy || recalling) return
+    setStage("live")
+    await start()
+  }
+
+  function skipCheck() {
+    setStage("idle")
+  }
 
   async function finish() {
-    if (busy) return
+    if (busy || recalling) return
     setBusy(true)
+    setRecalling(true)
     try {
       const url = recording ? await stop() : null
-      onFinish(url)
+      await new Promise((resolve) => window.setTimeout(resolve, 1500))
+      if (!cancelled.current) onFinish(url)
     } finally {
-      setBusy(false)
+      if (!cancelled.current) setBusy(false)
     }
   }
 
@@ -356,45 +405,94 @@ function Speak({
     <>
       <TopBar
         aside={
-          <button type="button" className="btn btn-quiet" onClick={() => setOpen(true)}>
-            再看一眼材料
-          </button>
+          recalling ? (
+            <span>简单复述</span>
+          ) : (
+            <button type="button" className="btn btn-quiet" onClick={() => setOpen(true)}>
+              再看一眼材料
+            </button>
+          )
         }
       />
-      <main className={recording ? "speak is-recording" : "speak"} data-recording={recording ? "1" : "0"}>
-        <p className="kind">{attempt === 2 ? "第二遍 · 同一篇材料" : "第一遍"}</p>
-        <h1>讲给小黄鸭听</h1>
-        <div className="speak-duck">
-          <Duck size={230} pose={recording ? "listening" : "attentive"} />
-        </div>
-        <p className={recording ? "timer is-live" : "timer"}>{formatTime(elapsed)}</p>
-        <p className="speak-status" role="status">
-          {recording
-            ? "小黄鸭在听。它不会插话。"
-            : attempt === 2
-              ? "还是这篇材料。它仍然没看过原文，也仍然不插话。"
-              : "它只听，不插话。"}
-        </p>
-        <div className="speak-actions">
-          {recording ? (
-            <button type="button" className="btn btn-primary" onClick={() => void finish()} disabled={busy}>
-              <span className="rec-dot" aria-hidden="true" />
-              讲完了
-            </button>
-          ) : (
-            <>
-              <button type="button" className="btn btn-primary" onClick={() => void start()}>
-                开始讲
+      <main
+        className={recording ? "speak is-recording" : "speak"}
+        data-recording={recording ? "1" : "0"}
+        data-speak-phase={speakPhase}
+      >
+        {recalling ? (
+          <>
+            <p className="kind">{attempt === 2 ? "第二遍" : "第一遍"}</p>
+            <h1>讲给小黄鸭听</h1>
+            <div className="speak-duck">
+              <Duck size={230} pose="attentive" />
+            </div>
+            <p className="speak-status recalling-status" role="status">
+              小黄鸭正在回想你说的话…
+            </p>
+          </>
+        ) : checking ? (
+          <>
+            <p className="kind">{attempt === 2 ? "第二遍 · 同一篇材料" : "第一遍"}</p>
+            <h1>先让它听见你</h1>
+            <div className="speak-duck">
+              <Duck size={230} pose={duckPose} />
+            </div>
+            <VoiceMeter bands={bands} demo={demoMode} />
+            <p className="speak-status" role="status">
+              {heardVoice
+                ? "声波在动，它听到了。可以开始复述。"
+                : "先对小黄鸭说一句「你好」。声波一动，就说明收到了。"}
+            </p>
+            <div className="speak-actions">
+              <button type="button" className="btn btn-primary" onClick={() => void beginSpeak()}>
+                开始复述
               </button>
-              <button type="button" className="btn btn-secondary" onClick={() => void finish()} disabled={busy}>
-                讲完了
+              <button type="button" className="btn btn-secondary" onClick={skipCheck}>
+                跳过试音
               </button>
-            </>
-          )}
-        </div>
-        {micNote ? <p className="mic-note">{micNote}</p> : null}
+            </div>
+            {micNote ? <p className="mic-note">{micNote}</p> : null}
+          </>
+        ) : (
+          <>
+            <p className="kind">{attempt === 2 ? "第二遍 · 同一篇材料" : "第一遍"}</p>
+            <h1>讲给小黄鸭听</h1>
+            <div className="speak-duck">
+              <Duck size={230} pose={duckPose} />
+            </div>
+            <VoiceMeter bands={bands} demo={demoMode} />
+            <p className={recording ? "timer is-live" : "timer"}>{formatTime(elapsed)}</p>
+            <p className="speak-status" role="status">
+              {recording
+                ? hearing
+                  ? `它这回是${material.listener}。它在听，不会插话。`
+                  : "它还在听。停顿久了，它会侧过头等你。"
+                : attempt === 2
+                  ? `还是这篇材料。它仍然是${material.listener}，仍然没看过原文，也不插话。`
+                  : `它这回是${material.listener}。它只听，不插话。`}
+            </p>
+            <div className="speak-actions">
+              {recording ? (
+                <button type="button" className="btn btn-primary" onClick={() => void finish()} disabled={busy}>
+                  <span className="rec-dot" aria-hidden="true" />
+                  讲完了
+                </button>
+              ) : (
+                <>
+                  <button type="button" className="btn btn-primary" onClick={() => void beginSpeak()}>
+                    开始讲
+                  </button>
+                  <button type="button" className="btn btn-secondary" onClick={() => void finish()} disabled={busy}>
+                    讲完了
+                  </button>
+                </>
+              )}
+            </div>
+            {micNote ? <p className="mic-note">{micNote}</p> : null}
+          </>
+        )}
       </main>
-      {open ? <SourceDrawer material={material} onClose={() => setOpen(false)} /> : null}
+      {open && !recalling ? <SourceDrawer material={material} onClose={() => setOpen(false)} /> : null}
     </>
   )
 }
@@ -461,7 +559,9 @@ function Feedback({
         </a>
         <Badge>示例逐字稿</Badge>
         <h1>你刚才讲的</h1>
-        <p className="lede">小黄鸭没看过原文，只听了这段话。先看逐字稿，再看它哪里没跟上。</p>
+        <p className="lede">
+          小黄鸭这回是{material.listener}，没看过原文，只听了这段话。先看逐字稿，再看它哪里没跟上。
+        </p>
         <div className="feedback-layout">
           <div>
             <SentenceList prefix="t1" sentences={sentences} marked={marked} onChange={onChange} />
@@ -472,7 +572,7 @@ function Feedback({
               <Duck size={52} pose="attentive" />
               <div>
                 <Badge>示例反馈</Badge>
-                <p>它没看过这篇材料。</p>
+                <p>它这回是{material.listener}。</p>
               </div>
             </div>
             <h2>这里我听懂了</h2>
@@ -490,6 +590,7 @@ function Feedback({
                 <p>{issue.comment}</p>
               </div>
             ))}
+            <PremiseChecklist premises={material.premises} attempt={1} />
             <EditNote edited={edited} />
             <div className="actions">
               <button type="button" className="btn btn-primary" onClick={onAgain}>
@@ -497,6 +598,9 @@ function Feedback({
               </button>
               <a className="btn btn-secondary" href={`#/done/${material.id}`}>
                 这次就到这里
+              </a>
+              <a className="btn btn-secondary" href={`#/report/${material.id}/1`}>
+                获取复述报告
               </a>
             </div>
           </aside>
@@ -561,7 +665,7 @@ function Compare({
             <Duck size={52} pose="attentive" />
             <div>
               <Badge>示例反馈</Badge>
-              <p>仍是那个没看过原文的听众。</p>
+              <p>仍是那个{material.listener}。</p>
             </div>
           </div>
           <h2>这里我跟上了</h2>
@@ -582,15 +686,156 @@ function Compare({
             「{quoteOf(material.attempt2, bucket.take2.texts, material.feedback2.stillSentenceId)}」
           </button>
           <p>{material.feedback2.still}</p>
+          <PremiseChecklist premises={material.premises} attempt={2} />
           <EditNote edited={edited} />
           <div className="actions">
             <a className="btn btn-primary" href={`#/done/${material.id}`}>
               结束这次练习
             </a>
+            <a className="btn btn-secondary" href={`#/report/${material.id}/2`}>
+              获取复述报告
+            </a>
           </div>
         </aside>
       </main>
     </>
+  )
+}
+
+function ReportPage({
+  material,
+  attempt,
+  bucket,
+}: {
+  material: Material
+  attempt: 1 | 2
+  bucket: Bucket
+}) {
+  const report = attempt === 1 ? material.report1 : material.report2
+  const previous = attempt === 2 ? material.report1 : null
+  const sentences = attempt === 1 ? material.attempt1 : material.attempt2
+  const take = attempt === 1 ? bucket.take1 : bucket.take2
+  const back = attempt === 1 ? `#/feedback/${material.id}` : `#/compare/${material.id}`
+
+  return (
+    <>
+      <TopBar aside={<span>简单复述</span>} />
+      <main className="page page-wide">
+        <a className="back" href={back}>
+          ← 返回{attempt === 1 ? "反馈" : "对照"}
+        </a>
+        <Badge>示例报告</Badge>
+        <h1>{attempt === 2 ? "第二遍的复述报告" : "复述报告"}</h1>
+        <p className="lede">
+          这是按示例逐字稿写好的评分，不是对刚才录音的计算。想认真复盘就看一看，只想随手练一下，也可以返回上一页。
+        </p>
+        <p className="mock-note">示例报告。分数是预先写好的，不会随你改字而重算。</p>
+        {previous ? (
+          <p className="report-change">
+            和上一遍比：材料匹配度 {previous.match.score} → {report.match.score}，逻辑完整性{" "}
+            {previous.logic.score} → {report.logic.score}，语言流畅度 {previous.fluency.score} →{" "}
+            {report.fluency.score}。
+          </p>
+        ) : null}
+        <div className="report-grid">
+          <ReportBlock
+            title="材料匹配度"
+            score={report.match.score}
+            previous={previous?.match.score}
+            quotes={report.match.quotes}
+            sentences={sentences}
+            texts={take.texts}
+          >
+            <p>{report.match.summary}</p>
+            <p>讲到了：{report.match.covered}</p>
+            <p>漏了：{report.match.missed}</p>
+            <p>讲错的地方：{report.match.wrong}</p>
+          </ReportBlock>
+          <ReportBlock
+            title="逻辑完整性"
+            score={report.logic.score}
+            previous={previous?.logic.score}
+            quotes={report.logic.quotes}
+            sentences={sentences}
+            texts={take.texts}
+          >
+            <p>{report.logic.summary}</p>
+            <p>顺序：{report.logic.order}</p>
+            <p>跳过的步骤：{report.logic.skipped}</p>
+            <p>前提：{report.logic.premises}</p>
+          </ReportBlock>
+          <ReportBlock
+            title="语言流畅度"
+            score={report.fluency.score}
+            previous={previous?.fluency.score}
+            quotes={report.fluency.quotes}
+            sentences={sentences}
+            texts={take.texts}
+          >
+            <p>{report.fluency.summary}</p>
+            <p>
+              口头禅：
+              {report.fluency.fillers.length === 0
+                ? "几乎没有。"
+                : report.fluency.fillers.map((item) => `${item.word} ${item.count} 次`).join("，") + "。"}
+            </p>
+            <p>重复：{report.fluency.repetition}</p>
+            <p>改口：{report.fluency.corrections}</p>
+          </ReportBlock>
+        </div>
+        <div className="actions">
+          <a className="btn btn-primary" href={back}>
+            返回{attempt === 1 ? "反馈" : "对照"}
+          </a>
+          {attempt === 1 ? (
+            <a className="btn btn-secondary" href={`#/done/${material.id}`}>
+              这次就到这里
+            </a>
+          ) : (
+            <a className="btn btn-secondary" href={`#/done/${material.id}`}>
+              结束这次练习
+            </a>
+          )}
+        </div>
+      </main>
+    </>
+  )
+}
+
+function ReportBlock({
+  title,
+  score,
+  previous,
+  quotes,
+  sentences,
+  texts,
+  children,
+}: {
+  title: string
+  score: number
+  previous?: number
+  quotes: Report["match"]["quotes"]
+  sentences: Sentence[]
+  texts: string[]
+  children: ReactNode
+}) {
+  return (
+    <section className="report-block">
+      <header className="report-head">
+        <h2>{title}</h2>
+        <p className="report-score">
+          {previous != null ? <span className="report-prev">{previous} → </span> : null}
+          <span>{score}</span>
+        </p>
+      </header>
+      {children}
+      {quotes.map((quote) => (
+        <blockquote key={`${quote.sentenceId}-${quote.note}`} className="report-quote">
+          <p>「{quoteOf(sentences, texts, quote.sentenceId)}」</p>
+          <p>{quote.note}</p>
+        </blockquote>
+      ))}
+    </section>
   )
 }
 
@@ -601,7 +846,7 @@ function Done({ material }: { material: Material }) {
       <main className="page">
         <h1>这次就到这里</h1>
         <p className="lede">
-          小黄鸭没看过原文。它听懂的，和没跟上的，都对着逐字稿写在上一页。没有分数。想再看，就回去看那两段话。
+          小黄鸭没看过原文。它听懂的，和没跟上的，都对着逐字稿写在上一页。想看综合评分，可以回去打开复述报告；也可以不看，直接回到工作台。
         </p>
         <div className="actions">
           <a className="btn btn-secondary" href={`#/compare/${material.id}`}>

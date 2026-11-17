@@ -1,4 +1,4 @@
-type Pose = "still" | "attentive" | "listening"
+type Pose = "still" | "attentive" | "listening" | "tilted"
 
 export function Duck({
   size = 180,
@@ -8,7 +8,13 @@ export function Duck({
   pose?: Pose
 }) {
   const poseClass =
-    pose === "listening" ? "is-listening" : pose === "attentive" ? "is-attentive" : ""
+    pose === "listening"
+      ? "is-listening"
+      : pose === "tilted"
+        ? "is-tilted"
+        : pose === "attentive"
+          ? "is-attentive"
+          : ""
   return (
     <svg
       width={size}

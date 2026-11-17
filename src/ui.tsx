@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import type { ReactNode } from "react"
-import type { Material, Sentence } from "./materials"
+import type { Material, Premise, Sentence } from "./materials"
 import { Duck } from "./duck"
 
 export function formatTime(totalSeconds: number): string {
@@ -211,6 +211,7 @@ export function SourceDrawer({
           </button>
         </div>
         <h2 id="source-title">{material.title}</h2>
+        <p className="context-line">{material.context}</p>
         <p className="drawer-note">这不是背诵。看一眼可以，讲的时候用自己的话。</p>
         {material.paragraphs.map((paragraph) => (
           <p key={paragraph}>{paragraph}</p>
@@ -224,5 +225,50 @@ export function EditNote({ edited }: { edited: boolean }) {
   if (!edited) return null
   return (
     <p className="edit-note">你改过示例逐字稿。示例反馈仍按改之前的稿子写，不会跟着重算。</p>
+  )
+}
+
+
+export function VoiceMeter({
+  bands,
+  demo,
+}: {
+  bands: number[]
+  demo?: boolean
+}) {
+  return (
+    <div className={demo ? "voice-meter is-demo" : "voice-meter"} aria-hidden="true">
+      {bands.map((value, index) => (
+        <span
+          key={index}
+          style={{ height: `${Math.max(10, Math.round(value * 100))}%` }}
+        />
+      ))}
+    </div>
+  )
+}
+
+export function PremiseChecklist({
+  premises,
+  attempt,
+}: {
+  premises: Premise[]
+  attempt: 1 | 2
+}) {
+  return (
+    <section className="premise-reveal">
+      <h3>讲给它听，这些前提交代清楚了没有</h3>
+      <ul>
+        {premises.map((premise) => {
+          const covered = premise.coveredIn.includes(attempt)
+          return (
+            <li key={premise.id} className={covered ? "is-covered" : "is-missed"}>
+              <span className="premise-flag">{covered ? "有讲到" : "没讲到"}</span>
+              <span>{premise.label}</span>
+            </li>
+          )
+        })}
+      </ul>
+    </section>
   )
 }
