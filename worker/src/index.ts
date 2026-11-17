@@ -84,14 +84,35 @@ async function requireCode(request: Request, env: Env, ip: string): Promise<void
   const expected = (env.ACCESS_CODE_SHA256 ?? "").trim().toLowerCase()
   const ok = code.length > 0 && code.length <= 200 && expected.length === 64 && constantTimeEqual(await sha256Hex(code), expected)
   if (ok) return
-  const { success } = await env.RL_AUTH.limit({ key: `auth:${ip}` })
-  if (!success) throw new HttpError(429, "rate_limited", "口令试错太多次，请一分钟后再试")
+  if (!(await allow(env.RL_AUTH, `auth:${ip}`))) throw new HttpError(429, "rate_limited", "口令试错太多次，请一分钟后再试")
   throw new HttpError(401, "bad_code", "访问口令不对")
 }
 
-async function limit(binding: RateLimit, key: string) {
+// 两层限流：Cloudflare 限流绑定（跨实例、按机房、最终一致）+ 本实例内的固定窗口计数（立即生效）。
+export const LOCAL_LIMITS: Record<string, number> = { auth: 10, asr: 30, llm: 12 }
+const localWindows = new Map<string, { start: number; count: number }>()
+
+function localAllow(key: string, max: number): boolean {
+  const now = Date.now()
+  const current = localWindows.get(key)
+  if (!current || now - current.start >= 60_000) {
+    if (localWindows.size > 5000) localWindows.clear()
+    localWindows.set(key, { start: now, count: 1 })
+    return true
+  }
+  current.count++
+  return current.count <= max
+}
+
+async function allow(binding: RateLimit, key: string): Promise<boolean> {
+  const kind = key.split(":")[0] ?? ""
+  const local = localAllow(key, LOCAL_LIMITS[kind] ?? 10)
   const { success } = await binding.limit({ key })
-  if (!success) throw new HttpError(429, "rate_limited", "请求太频繁，请稍等一分钟再试")
+  return local && success
+}
+
+async function limit(binding: RateLimit, key: string) {
+  if (!(await allow(binding, key))) throw new HttpError(429, "rate_limited", "请求太频繁，请稍等一分钟再试")
 }
 
 // ---------- 转写 ----------
