@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import type { ReactNode } from "react"
-import type { Material, Premise, Sentence } from "./materials"
+import type { Material, Sentence } from "./materials"
 import { Duck } from "./duck"
 
 export function formatTime(totalSeconds: number): string {
@@ -221,10 +221,21 @@ export function SourceDrawer({
   )
 }
 
-export function EditNote({ edited }: { edited: boolean }) {
+export function EditNote({
+  edited,
+  onRelisten,
+}: {
+  edited: boolean
+  onRelisten: () => void
+}) {
   if (!edited) return null
   return (
-    <p className="edit-note">你改过示例逐字稿。示例反馈仍按改之前的稿子写，不会跟着重算。</p>
+    <div className="edit-note">
+      <p>改过逐字稿，可以重新听一遍。上面的反馈还是按改之前的稿子给的。</p>
+      <button type="button" className="btn btn-secondary btn-small" onClick={onRelisten}>
+        让小黄鸭重新听
+      </button>
+    </div>
   )
 }
 
@@ -250,24 +261,19 @@ export function VoiceMeter({
 
 export function PremiseChecklist({
   premises,
-  attempt,
 }: {
-  premises: Premise[]
-  attempt: 1 | 2
+  premises: ReadonlyArray<{ id?: string; label: string; covered: boolean }>
 }) {
   return (
     <section className="premise-reveal">
       <h3>讲给它听，这些前提交代清楚了没有</h3>
       <ul>
-        {premises.map((premise) => {
-          const covered = premise.coveredIn.includes(attempt)
-          return (
-            <li key={premise.id} className={covered ? "is-covered" : "is-missed"}>
-              <span className="premise-flag">{covered ? "有讲到" : "没讲到"}</span>
-              <span>{premise.label}</span>
-            </li>
-          )
-        })}
+        {premises.map((premise, index) => (
+          <li key={premise.id ?? index} className={premise.covered ? "is-covered" : "is-missed"}>
+            <span className="premise-flag">{premise.covered ? "有讲到" : "没讲到"}</span>
+            <span>{premise.label}</span>
+          </li>
+        ))}
       </ul>
     </section>
   )

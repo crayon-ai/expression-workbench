@@ -4,9 +4,31 @@ const BAND_COUNT = 16
 const SILENCE_MS = 2000
 const VOICE_THRESHOLD = 0.045
 const DEMO_NOTE =
-  "麦克风没有打开，现在是演示模式。声波是示意，不会挡住你。点「开始复述」或「讲完了」，都会进入示例逐字稿。"
+  "麦克风没有打开。没有麦克风就不能转写，讲完之后会改成手动输入：把你讲的话打出来当逐字稿。"
 
 export type RecorderPhase = "idle" | "checking" | "recording"
+
+export type StopResult = {
+  url: string | null
+  blob: Blob | null
+  pcm: Float32Array | null
+  rate: number
+}
+
+function emptyStop(): StopResult {
+  return { url: null, blob: null, pcm: null, rate: 0 }
+}
+
+function concatFloat32(parts: Float32Array[]): Float32Array {
+  const total = parts.reduce((sum, part) => sum + part.length, 0)
+  const out = new Float32Array(total)
+  let at = 0
+  for (const part of parts) {
+    out.set(part, at)
+    at += part.length
+  }
+  return out
+}
 
 function pickMime(): string {
   if (typeof MediaRecorder === "undefined") return ""
@@ -94,6 +116,12 @@ export function useRecorder() {
   const lastVoiceRef = useRef<number | null>(null)
   const bandsRef = useRef<number[]>(emptyBands())
   const activeRef = useRef(false)
+  // 录音时顺带收一份 PCM。decodeAudioData 不认录下的格式时（Safari 偶尔会），拿它当退路。
+  const pcmChunksRef = useRef<Float32Array[]>([])
+  const pcmSourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const pcmProcessorRef = useRef<ScriptProcessorNode | null>(null)
+  const pcmSinkRef = useRef<GainNode | null>(null)
+  const sampleRateRef = useRef(0)
 
   function stopTimer() {
     if (timerRef.current) {
@@ -116,6 +144,40 @@ export function useRecorder() {
   function releaseStream() {
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
+  }
+
+  function stopPcmCapture() {
+    if (pcmProcessorRef.current) {
+      pcmProcessorRef.current.onaudioprocess = null
+      pcmProcessorRef.current.disconnect()
+      pcmProcessorRef.current = null
+    }
+    pcmSourceRef.current?.disconnect()
+    pcmSourceRef.current = null
+    pcmSinkRef.current?.disconnect()
+    pcmSinkRef.current = null
+  }
+
+  function startPcmCapture() {
+    stopPcmCapture()
+    const ctx = ctxRef.current
+    const stream = streamRef.current
+    if (!ctx || !stream || typeof ctx.createScriptProcessor !== "function") return
+    pcmChunksRef.current = []
+    sampleRateRef.current = ctx.sampleRate
+    const source = ctx.createMediaStreamSource(stream)
+    const processor = ctx.createScriptProcessor(4096, 1, 1)
+    const sink = ctx.createGain()
+    sink.gain.value = 0
+    processor.onaudioprocess = (event) => {
+      pcmChunksRef.current.push(new Float32Array(event.inputBuffer.getChannelData(0)))
+    }
+    source.connect(processor)
+    processor.connect(sink)
+    sink.connect(ctx.destination)
+    pcmSourceRef.current = source
+    pcmProcessorRef.current = processor
+    pcmSinkRef.current = sink
   }
 
   function tickMeter() {
@@ -225,7 +287,7 @@ export function useRecorder() {
         return
       }
       if (typeof MediaRecorder === "undefined") {
-        enterDemo("这里录不了音，现在是演示模式。你可以继续讲，点「讲完了」会进入示例逐字稿。")
+        enterDemo("这里录不了音。讲完之后会改成手动输入：把你讲的话打出来当逐字稿。")
         const startedAt = Date.now()
         setPhase("recording")
         timerRef.current = window.setInterval(() => {
@@ -241,6 +303,7 @@ export function useRecorder() {
       }
       recorderRef.current = recorder
       recorder.start()
+      startPcmCapture()
       const startedAt = Date.now()
       setPhase("recording")
       if (!activeRef.current) startMeter()
@@ -252,14 +315,15 @@ export function useRecorder() {
     }
   }
 
-  function stop(): Promise<string | null> {
+  function stop(): Promise<StopResult> {
     stopTimer()
     const recorder = recorderRef.current
     if (!recorder || recorder.state === "inactive") {
       setPhase("idle")
+      stopPcmCapture()
       stopMeter()
       releaseStream()
-      return Promise.resolve(null)
+      return Promise.resolve(emptyStop())
     }
     return new Promise((resolve) => {
       recorder.onstop = () => {
@@ -267,11 +331,14 @@ export function useRecorder() {
           type: recorder.mimeType || "audio/webm",
         })
         const url = blob.size > 0 ? URL.createObjectURL(blob) : null
+        const pcm = pcmChunksRef.current.length > 0 ? concatFloat32(pcmChunksRef.current) : null
+        const rate = sampleRateRef.current
         recorderRef.current = null
+        stopPcmCapture()
         stopMeter()
         releaseStream()
         setPhase("idle")
-        resolve(url)
+        resolve({ url, blob: blob.size > 0 ? blob : null, pcm, rate })
       }
       recorder.stop()
     })
@@ -287,6 +354,7 @@ export function useRecorder() {
       window.removeEventListener("pointerdown", unlock)
       window.removeEventListener("keydown", unlock)
       stopTimer()
+      stopPcmCapture()
       stopMeter()
       if (recorderRef.current && recorderRef.current.state !== "inactive") {
         try {
