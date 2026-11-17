@@ -8,6 +8,7 @@ export type ApiErrorKind =
   | "too_large"
   | "rate_limited"
   | "unavailable"
+  | "not_configured"
   | "upstream"
   | "network"
   | "server"
@@ -60,7 +61,8 @@ async function request(path: string, init: RequestInit, timeoutMs: number): Prom
   else if (response.status === 403 || detail === "forbidden_origin") kind = "forbidden_origin"
   else if (response.status === 413 || detail === "too_large" || detail === "too_long") kind = "too_large"
   else if (response.status === 429 || detail === "rate_limited") kind = "rate_limited"
-  else if (response.status === 503 || detail === "not_configured" || detail === "asr_unavailable") kind = "unavailable"
+  else if (detail === "not_configured") kind = "not_configured"
+  else if (response.status === 503 || detail === "asr_unavailable") kind = "unavailable"
   else if (response.status === 502 || detail === "upstream") kind = "upstream"
   throw new ApiError(kindMessage(kind, response.status), kind)
 }
@@ -79,6 +81,8 @@ function kindMessage(kind: ApiErrorKind, status: number): string {
       return "请求太频繁了，等一分钟再试"
     case "unavailable":
       return "语音识别暂时不可用"
+    case "not_configured":
+      return "小黄鸭的后台还没配置好"
     case "upstream":
       return "上游服务出了问题"
     default:
@@ -91,7 +95,7 @@ export async function checkAccessCode(code: string): Promise<void> {
   const saved = getAccessCode()
   try {
     setAccessCode(code)
-    const data = await request("/check", { method: "POST" }, 15000)
+    const data = await request("/api/check", { method: "POST" }, 15000)
     if (!data || typeof data !== "object" || (data as { ok?: unknown }).ok !== true) {
       throw new ApiError("口令不对", "bad_code")
     }
@@ -123,7 +127,7 @@ export async function transcribeChunks(
     form.append("file", chunks[i] as Blob, `chunk-${i + 1}.wav`)
     form.append("prompt", text.slice(-200))
     form.append("materialId", materialId)
-    const data = await request("/transcribe", { method: "POST", body: form }, 45000)
+    const data = await request("/api/transcribe", { method: "POST", body: form }, 45000)
     const piece =
       data && typeof data === "object" && typeof (data as { text?: unknown }).text === "string"
         ? (data as { text: string }).text.trim()
@@ -142,7 +146,7 @@ export async function requestFeedback(body: {
   previousTranscript?: string
 }): Promise<FeedbackData> {
   const data = await request(
-    "/feedback",
+    "/api/feedback",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -186,7 +190,7 @@ export type ReportData = {
 
 export async function requestReport(body: { materialId: string; transcript: string }): Promise<ReportData> {
   const data = await request(
-    "/report",
+    "/api/report",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },

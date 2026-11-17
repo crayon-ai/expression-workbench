@@ -602,7 +602,7 @@ function Speak({
 function PrivacyNote() {
   return (
     <p className="privacy-note">
-      录音会经我们的服务器发给智谱做语音转写，转完不保存；逐字稿只留在这个页面里。
+      录音经我们的服务器交给 Cloudflare 上的语音识别模型转成文字，转完不保存；你点「看看小黄鸭听到了什么」时，逐字稿会发给智谱生成反馈，也不保存。
     </p>
   )
 }

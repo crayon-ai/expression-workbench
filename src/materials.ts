@@ -39,7 +39,8 @@ export function splitSentences(text: string): Sentence[] {
   let buffer = ""
   for (const char of text) {
     buffer += char
-    if ("。！？!?；…".includes(char) || char === "\n") {
+    // 句末标点断句；语音识别常只给逗号，所以一句太长时也在逗号处断开
+    if ("。！？!?；…".includes(char) || char === "\n" || ("，,".includes(char) && buffer.length >= 24)) {
       if (buffer.trim()) out.push({ id: `s${out.length + 1}`, text: buffer.trim() })
       buffer = ""
     }

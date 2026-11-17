@@ -4,23 +4,28 @@
 
 ## 后端
 
-转写、反馈、报告走 `suntao-expression-api`（Cloudflare Worker），接口见 `worker/README.md`。默认地址：
+前端静态文件和 `/api/*` 接口由同一个 Cloudflare Worker（`suntao-expression-api`）提供，网址：
 
 ```
-https://suntao-expression-api.suntao-preview.workers.dev
+https://suntao-expression-api.suntao-preview.workers.dev/
 ```
 
-可用环境变量 `VITE_API_BASE` 覆盖（本地调试 Worker 时）：
+不再用 GitHub Pages，前端请求走同源相对路径 `/api/*`，不需要另外配置后端地址。接口细节见 `worker/README.md`。本地开发想让前端指向本机 Worker，可用环境变量 `VITE_API_BASE` 覆盖（默认同源）：
 
 ```bash
 VITE_API_BASE=http://127.0.0.1:8787 npm run dev
 ```
 
-进入「简单复述」选材料页时需要输入访问口令，前端调 `POST /check` 校验，通过后只存在这个标签页的 sessionStorage（key：`expression-workbench.access-code`），不进代码、不进构建产物。口令错了会提示「口令不对」，可以重输；页面上有「换一个口令」的入口。
+进入「简单复述」选材料页时需要输入访问口令，前端调 `POST /api/check` 校验，通过后只存在这个标签页的 sessionStorage（key：`expression-workbench.access-code`），不进代码、不进构建产物。口令错了会提示「口令不对」，可以重输；页面上有「换一个口令」的入口。
+
+## 模型
+
+- 语音转写：Cloudflare Workers AI 的 `@cf/openai/whisper-large-v3-turbo`。
+- 反馈和复述报告：智谱 `glm-5.3`。
 
 ## 隐私
 
-录音会经我们的服务器发给智谱做语音转写，转完不保存；逐字稿只留在页面里（刷新就没有）。后端也不存录音、不存逐字稿。没有麦克风或转写失败时，会改成手动输入逐字稿，页面会写明这一点。
+录音经我们的服务器交给 Cloudflare 上的语音识别模型转成文字，转完不保存；你点「看看小黄鸭听到了什么」时，逐字稿会发给智谱生成反馈，也不保存。逐字稿只留在页面里（刷新就没有），后端也不存录音、不存逐字稿。没有麦克风或转写失败时，会改成手动输入逐字稿，页面会写明这一点。
 
 ## 怎么打开
 

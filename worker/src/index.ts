@@ -1,36 +1,37 @@
-// suntao-expression-api：表达训练工作台「简单复述」的后端。
-// 只做三件事：转写一段录音、按材料给听众反馈、生成复述报告。
-// 不存录音、不存逐字稿。所有密钥只在 Worker secret 里。
+// suntao-expression-api：表达训练工作台「简单复述」。
+// 同一个 Worker 同时提供前端静态文件（构建时内嵌进脚本，见 worker/build.mjs）和同源接口 /api/*：
+// 转写（Workers AI Whisper）、按材料给听众反馈、生成复述报告（智谱 glm-5.3）。
+// 不存录音、不存逐字稿。密钥只在 Worker secret 里。
 
 import { findMaterialDef, type MaterialDef } from "../../shared/materials"
+import embedded from "virtual:assets"
 
 type RateLimit = { limit(options: { key: string }): Promise<{ success: boolean }> }
+type Ai = { run(model: string, input: Record<string, unknown>): Promise<unknown> }
 
 interface Env {
-  GLM_API_KEY: string
+  AI: Ai // Workers AI，语音转写
+  GLM_API_KEY?: string // 智谱（反馈和报告）
   ACCESS_CODE_SHA256: string // 访问口令的 SHA-256（hex），不存明文
   RL_AUTH: RateLimit // 口令错误
   RL_ASR: RateLimit // 转写
   RL_LLM: RateLimit // 反馈 + 报告
-  ALLOWED_ORIGINS?: string // 逗号分隔，覆盖默认
+  DEV_ORIGINS?: string // 逗号分隔；只用于本地开发时额外放行的来源
 }
 
-const DEFAULT_ORIGINS = [
-  "https://crayon-ai.github.io",
-  "http://localhost:4731",
-  "http://127.0.0.1:4731",
-]
+// 默认只接受同源请求（页面和接口同一个 Worker）。本地开发额外放行这两个。
+const DEV_ORIGINS = ["http://localhost:4731", "http://127.0.0.1:4731"]
 
 export const LIMITS = {
   audioBytes: 1_000_000, // 单段 WAV 上限（16kHz 单声道 16bit 约 31 秒）
-  audioSeconds: 30, // 智谱单次上限 30 秒；前端按 25 秒切段
+  audioSeconds: 30, // 与 Whisper 的 30 秒窗口对齐；前端按 25 秒、在停顿处切段
   promptChars: 500, // 转写上下文
   transcriptChars: 4000, // 单遍逐字稿
   jsonBytes: 32_000, // /feedback /report 请求体
 }
 
 const ZHIPU = "https://open.bigmodel.cn/api/paas/v4"
-const ASR_MODEL = "glm-asr-2512"
+const ASR_MODEL = "@cf/openai/whisper-large-v3-turbo"
 const TEXT_MODEL = "glm-5.3"
 
 class HttpError extends Error {
@@ -43,13 +44,14 @@ class HttpError extends Error {
   }
 }
 
-function allowedOrigins(env: Env): string[] {
-  const raw = env.ALLOWED_ORIGINS?.trim()
-  return raw ? raw.split(",").map((item) => item.trim()).filter(Boolean) : DEFAULT_ORIGINS
+function devOrigins(env: Env): string[] {
+  const raw = env.DEV_ORIGINS?.trim()
+  return raw ? raw.split(",").map((item) => item.trim()).filter(Boolean) : DEV_ORIGINS
 }
 
+// 跨源只给本地开发来源发 CORS 头；同源请求不需要。
 function corsHeaders(origin: string | null, env: Env): Record<string, string> {
-  if (!origin || !allowedOrigins(env).includes(origin)) return {}
+  if (!origin || !devOrigins(env).includes(origin)) return {}
   return {
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -118,19 +120,27 @@ async function limit(binding: RateLimit, key: string) {
 // ---------- 转写 ----------
 
 function wavSeconds(bytes: Uint8Array): number {
+  return wavInfo(bytes).seconds
+}
+
+function wavInfo(bytes: Uint8Array): { seconds: number; dataOffset: number; dataSize: number; bits: number } {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const tag = (offset: number) => String.fromCharCode(...bytes.subarray(offset, offset + 4))
   if (bytes.length < 44 || tag(0) !== "RIFF" || tag(8) !== "WAVE") throw new HttpError(400, "bad_audio", "只接受 WAV 录音")
   let offset = 12
   let byteRate = 0
+  let bits = 16
   while (offset + 8 <= bytes.length) {
     const id = tag(offset)
     const size = view.getUint32(offset + 4, true)
-    if (id === "fmt ") byteRate = view.getUint32(offset + 16, true)
+    if (id === "fmt ") {
+      byteRate = view.getUint32(offset + 16, true)
+      bits = view.getUint16(offset + 22, true)
+    }
     if (id === "data") {
       if (!byteRate) break
       const dataSize = Math.min(size, bytes.length - offset - 8)
-      return dataSize / byteRate
+      return { seconds: dataSize / byteRate, dataOffset: offset + 8, dataSize, bits }
     }
     offset += 8 + size + (size % 2)
   }
@@ -147,43 +157,74 @@ async function transcribe(request: Request, env: Env): Promise<unknown> {
   const bytes = new Uint8Array(await file.arrayBuffer())
   const seconds = wavSeconds(bytes)
   if (seconds > LIMITS.audioSeconds + 0.5) throw new HttpError(413, "too_long", "这一段录音超过 30 秒")
-  if (seconds < 0.3) return { text: "" }
+  if (seconds < 0.3 || isSilent(bytes)) return { text: "", seconds: Math.round(seconds * 10) / 10, model: ASR_MODEL }
 
-  const prompt = String(form.get("prompt") ?? "").slice(-LIMITS.promptChars)
-  const material = findMaterialDef(String(form.get("materialId") ?? ""))
-
-  const upstream = new FormData()
-  upstream.append("model", ASR_MODEL)
-  upstream.append("stream", "false")
-  upstream.append("file", new Blob([bytes], { type: "audio/wav" }), "speech.wav")
-  if (prompt) upstream.append("prompt", prompt)
-  // 热词（material.hotwords）的 multipart 写法官方文档没写清，账户无转写额度时无法验证，暂不发送。
-  void material
-
-  const response = await fetch(`${ZHIPU}/audio/transcriptions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${env.GLM_API_KEY}` },
-    body: upstream,
-  })
-  if (!response.ok) {
-    let upstreamCode = ""
-    try {
-      upstreamCode = String(((await response.json()) as { error?: { code?: unknown } }).error?.code ?? "")
-    } catch {
-      // ignore
-    }
-    console.log("asr upstream", response.status, upstreamCode)
-    if (upstreamCode === "1113") throw new HttpError(503, "asr_unavailable", "语音转写额度不足，暂时用不了")
-    throw new HttpError(502, "upstream", "语音转写服务暂时不可用")
+  let raw: unknown
+  try {
+    raw = await env.AI.run(ASR_MODEL, { audio: toBase64(bytes), language: "zh", task: "transcribe" })
+  } catch (error) {
+    console.log("asr failed", error instanceof Error ? error.message.slice(0, 200) : "unknown")
+    throw new HttpError(503, "asr_unavailable", "语音识别暂时不可用")
   }
-  const data = (await response.json()) as { text?: unknown }
-  if (typeof data.text !== "string") throw new HttpError(502, "upstream", "语音转写没有返回文字")
-  return { text: data.text.trim(), seconds: Math.round(seconds * 10) / 10, model: ASR_MODEL }
+  const text = (raw as { text?: unknown } | null)?.text
+  if (typeof text !== "string") throw new HttpError(502, "upstream", "语音识别没有返回文字")
+  return { text: dropHallucination(tidyTranscript(text)), seconds: Math.round(seconds * 10) / 10, model: ASR_MODEL }
+}
+
+// 整段都很安静（最响的 100ms 也低于阈值）就不送识别：Whisper 对静音容易编出「谢谢观看」之类的话。
+function isSilent(bytes: Uint8Array): boolean {
+  const info = wavInfo(bytes)
+  if (info.bits !== 16) return false // 只判断 16bit PCM；其它格式交给模型
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  const start = info.dataOffset
+  const samples = Math.floor(info.dataSize / 2)
+  const frame = 1600
+  let loudest = 0
+  for (let f = 0; f + frame <= samples; f += frame) {
+    let sum = 0
+    for (let i = 0; i < frame; i++) {
+      const v = view.getInt16(start + (f + i) * 2, true) / 32768
+      sum += v * v
+    }
+    loudest = Math.max(loudest, Math.sqrt(sum / frame))
+  }
+  return loudest < 0.01
+}
+
+// Whisper 在空白处常见的幻觉句，整段只有这些时当作没说话。
+const HALLUCINATIONS = [/^谢谢(大家)?(观看|收看|收听)[。！!]?$/, /字幕(由|提供|志愿者)/, /请不吝点赞/, /订阅.*转发/, /Amara\.org/i]
+
+function dropHallucination(text: string): string {
+  const t = text.trim()
+  return HALLUCINATIONS.some((re) => re.test(t)) ? "" : t
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = ""
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  return btoa(binary)
+}
+
+// Whisper 常用空格隔开停顿、用半角标点。只换标点，不改字：
+// 汉字之间的空白 → 「，」；半角 ,.?!; → 全角。
+export function tidyTranscript(text: string): string {
+  const cjk = "\\u3400-\\u9fff"
+  return text
+    .trim()
+    .replace(new RegExp(`([${cjk}])\\s+(?=[${cjk}])`, "g"), "$1，")
+    .replace(new RegExp(`([${cjk}]),\\s*`, "g"), "$1，")
+    .replace(new RegExp(`([${cjk}])\\.(?!\\d)\\s*`, "g"), "$1。")
+    .replace(new RegExp(`([${cjk}])\\?\\s*`, "g"), "$1？")
+    .replace(new RegExp(`([${cjk}])!\\s*`, "g"), "$1！")
+    .replace(new RegExp(`([${cjk}]);\\s*`, "g"), "$1；")
+    .replace(/\s{2,}/g, " ")
 }
 
 // ---------- 文本模型 ----------
 
 async function chatJson(env: Env, system: string, user: string): Promise<Record<string, unknown>> {
+  // 请求先过完校验（材料、长度）再检查 key，这样没配 key 时也能验证上限
+  if (!env.GLM_API_KEY) throw new HttpError(503, "not_configured", "小黄鸭的后台还没配置好")
   const response = await fetch(`${ZHIPU}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${env.GLM_API_KEY}`, "Content-Type": "application/json" },
@@ -468,32 +509,63 @@ async function report(raw: string, env: Env): Promise<unknown> {
   })
 }
 
+// ---------- 静态文件 ----------
+
+const decodedAssets = new Map<string, Uint8Array<ArrayBuffer>>()
+
+const SECURITY_HEADERS: Record<string, string> = {
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "Permissions-Policy": "microphone=(self), camera=(), geolocation=()",
+  "Content-Security-Policy":
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+}
+
+function serveStatic(request: Request, url: URL): Response {
+  if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method Not Allowed", { status: 405 })
+  const path = url.pathname === "/" ? "/index.html" : url.pathname
+  const asset = embedded[path]
+  if (!asset) return new Response("Not Found", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8", ...SECURITY_HEADERS } })
+  let body = decodedAssets.get(path)
+  if (!body) {
+    const binary = atob(asset.b64)
+    body = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) body[i] = binary.charCodeAt(i)
+    decodedAssets.set(path, body)
+  }
+  const immutable = path.startsWith("/assets/")
+  return new Response(request.method === "HEAD" ? null : body, {
+    headers: {
+      "Content-Type": asset.type,
+      "Cache-Control": immutable ? "public, max-age=31536000, immutable" : "no-cache",
+      ...SECURITY_HEADERS,
+    },
+  })
+}
+
 // ---------- 入口 ----------
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url)
+    if (!url.pathname.startsWith("/api/")) return serveStatic(request, url)
+
     const origin = request.headers.get("Origin")
     const cors = corsHeaders(origin, env)
-    const url = new URL(request.url)
+    const sameOrigin = origin === url.origin
+    const allowed = sameOrigin || Object.keys(cors).length > 0
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: Object.keys(cors).length ? 204 : 403, headers: cors })
+      return new Response(null, { status: allowed ? 204 : 403, headers: cors })
     }
-    if (request.method === "GET" && url.pathname === "/") {
-      return json({ ok: true, service: "suntao-expression-api" }, 200, cors)
-    }
-    if (!origin || !allowedOrigins(env).includes(origin)) {
-      return json({ error: "forbidden_origin", message: "来源不被允许" }, 403, {})
-    }
+    if (!allowed) return json({ error: "forbidden_origin", message: "来源不被允许" }, 403, {})
     if (request.method !== "POST") return json({ error: "not_found", message: "没有这个接口" }, 404, cors)
 
     const ip = request.headers.get("CF-Connecting-IP") ?? "unknown"
     try {
       await requireCode(request, env, ip)
-      if (url.pathname !== "/check" && !env.GLM_API_KEY) {
-        throw new HttpError(503, "not_configured", "智谱接口还没配置好")
-      }
-      switch (url.pathname) {
+      const path = url.pathname.slice(4) // 去掉 /api
+      switch (path) {
         case "/check":
           return json({ ok: true }, 200, cors)
         case "/transcribe":
