@@ -1,20 +1,17 @@
 // suntao-expression-api：表达训练工作台「简单复述」。
 // 同一个 Worker 同时提供前端静态文件（构建时内嵌进脚本，见 worker/build.mjs）和同源接口 /api/*：
-// 转写（Workers AI Whisper）、按材料给听众反馈、生成复述报告（智谱 glm-5.3）。
-// 不存录音、不存逐字稿。密钥只在 Worker secret 里。
+// 按材料给听众反馈、生成复述报告（智谱 glm-5.3）。语音转写在用户浏览器里本地完成，录音不上传。
+// 不存逐字稿。密钥只在 Worker secret 里。
 
 import { findMaterialDef, type MaterialDef } from "../../shared/materials"
 import embedded from "virtual:assets"
 
 type RateLimit = { limit(options: { key: string }): Promise<{ success: boolean }> }
-type Ai = { run(model: string, input: Record<string, unknown>): Promise<unknown> }
 
 interface Env {
-  AI: Ai // Workers AI，语音转写
   GLM_API_KEY?: string // 智谱（反馈和报告）
   ACCESS_CODE_SHA256: string // 访问口令的 SHA-256（hex），不存明文
   RL_AUTH: RateLimit // 口令错误
-  RL_ASR: RateLimit // 转写
   RL_LLM: RateLimit // 反馈 + 报告
   DEV_ORIGINS?: string // 逗号分隔；只用于本地开发时额外放行的来源
 }
@@ -23,15 +20,11 @@ interface Env {
 const DEV_ORIGINS = ["http://localhost:4731", "http://127.0.0.1:4731"]
 
 export const LIMITS = {
-  audioBytes: 1_000_000, // 单段 WAV 上限（16kHz 单声道 16bit 约 31 秒）
-  audioSeconds: 30, // 与 Whisper 的 30 秒窗口对齐；前端按 25 秒、在停顿处切段
-  promptChars: 500, // 转写上下文
   transcriptChars: 4000, // 单遍逐字稿
   jsonBytes: 32_000, // /feedback /report 请求体
 }
 
 const ZHIPU = "https://open.bigmodel.cn/api/paas/v4"
-const ASR_MODEL = "@cf/openai/whisper-large-v3-turbo"
 const TEXT_MODEL = "glm-5.3"
 
 class HttpError extends Error {
@@ -91,7 +84,7 @@ async function requireCode(request: Request, env: Env, ip: string): Promise<void
 }
 
 // 两层限流：Cloudflare 限流绑定（跨实例、按机房、最终一致）+ 本实例内的固定窗口计数（立即生效）。
-export const LOCAL_LIMITS: Record<string, number> = { auth: 10, asr: 30, llm: 12 }
+export const LOCAL_LIMITS: Record<string, number> = { auth: 10, llm: 12 }
 const localWindows = new Map<string, { start: number; count: number }>()
 
 function localAllow(key: string, max: number): boolean {
@@ -115,109 +108,6 @@ async function allow(binding: RateLimit, key: string): Promise<boolean> {
 
 async function limit(binding: RateLimit, key: string) {
   if (!(await allow(binding, key))) throw new HttpError(429, "rate_limited", "请求太频繁，请稍等一分钟再试")
-}
-
-// ---------- 转写 ----------
-
-function wavSeconds(bytes: Uint8Array): number {
-  return wavInfo(bytes).seconds
-}
-
-function wavInfo(bytes: Uint8Array): { seconds: number; dataOffset: number; dataSize: number; bits: number } {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  const tag = (offset: number) => String.fromCharCode(...bytes.subarray(offset, offset + 4))
-  if (bytes.length < 44 || tag(0) !== "RIFF" || tag(8) !== "WAVE") throw new HttpError(400, "bad_audio", "只接受 WAV 录音")
-  let offset = 12
-  let byteRate = 0
-  let bits = 16
-  while (offset + 8 <= bytes.length) {
-    const id = tag(offset)
-    const size = view.getUint32(offset + 4, true)
-    if (id === "fmt ") {
-      byteRate = view.getUint32(offset + 16, true)
-      bits = view.getUint16(offset + 22, true)
-    }
-    if (id === "data") {
-      if (!byteRate) break
-      const dataSize = Math.min(size, bytes.length - offset - 8)
-      return { seconds: dataSize / byteRate, dataOffset: offset + 8, dataSize, bits }
-    }
-    offset += 8 + size + (size % 2)
-  }
-  throw new HttpError(400, "bad_audio", "录音文件格式不完整")
-}
-
-async function transcribe(request: Request, env: Env): Promise<unknown> {
-  const length = Number(request.headers.get("Content-Length") ?? "0")
-  if (length > LIMITS.audioBytes + 20_000) throw new HttpError(413, "too_large", "这一段录音太大")
-  const form = await request.formData()
-  const file = form.get("file")
-  if (!file || typeof file === "string") throw new HttpError(400, "bad_audio", "没有收到录音")
-  if (file.size > LIMITS.audioBytes) throw new HttpError(413, "too_large", "这一段录音太大")
-  const bytes = new Uint8Array(await file.arrayBuffer())
-  const seconds = wavSeconds(bytes)
-  if (seconds > LIMITS.audioSeconds + 0.5) throw new HttpError(413, "too_long", "这一段录音超过 30 秒")
-  if (seconds < 0.3 || isSilent(bytes)) return { text: "", seconds: Math.round(seconds * 10) / 10, model: ASR_MODEL }
-
-  let raw: unknown
-  try {
-    raw = await env.AI.run(ASR_MODEL, { audio: toBase64(bytes), language: "zh", task: "transcribe" })
-  } catch (error) {
-    console.log("asr failed", error instanceof Error ? error.message.slice(0, 200) : "unknown")
-    throw new HttpError(503, "asr_unavailable", "语音识别暂时不可用")
-  }
-  const text = (raw as { text?: unknown } | null)?.text
-  if (typeof text !== "string") throw new HttpError(502, "upstream", "语音识别没有返回文字")
-  return { text: dropHallucination(tidyTranscript(text)), seconds: Math.round(seconds * 10) / 10, model: ASR_MODEL }
-}
-
-// 整段都很安静（最响的 100ms 也低于阈值）就不送识别：Whisper 对静音容易编出「谢谢观看」之类的话。
-function isSilent(bytes: Uint8Array): boolean {
-  const info = wavInfo(bytes)
-  if (info.bits !== 16) return false // 只判断 16bit PCM；其它格式交给模型
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  const start = info.dataOffset
-  const samples = Math.floor(info.dataSize / 2)
-  const frame = 1600
-  let loudest = 0
-  for (let f = 0; f + frame <= samples; f += frame) {
-    let sum = 0
-    for (let i = 0; i < frame; i++) {
-      const v = view.getInt16(start + (f + i) * 2, true) / 32768
-      sum += v * v
-    }
-    loudest = Math.max(loudest, Math.sqrt(sum / frame))
-  }
-  return loudest < 0.01
-}
-
-// Whisper 在空白处常见的幻觉句，整段只有这些时当作没说话。
-const HALLUCINATIONS = [/^谢谢(大家)?(观看|收看|收听)[。！!]?$/, /字幕(由|提供|志愿者)/, /请不吝点赞/, /订阅.*转发/, /Amara\.org/i]
-
-function dropHallucination(text: string): string {
-  const t = text.trim()
-  return HALLUCINATIONS.some((re) => re.test(t)) ? "" : t
-}
-
-function toBase64(bytes: Uint8Array): string {
-  let binary = ""
-  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
-  return btoa(binary)
-}
-
-// Whisper 常用空格隔开停顿、用半角标点。只换标点，不改字：
-// 汉字之间的空白 → 「，」；半角 ,.?!; → 全角。
-export function tidyTranscript(text: string): string {
-  const cjk = "\\u3400-\\u9fff"
-  return text
-    .trim()
-    .replace(new RegExp(`([${cjk}])\\s+(?=[${cjk}])`, "g"), "$1，")
-    .replace(new RegExp(`([${cjk}]),\\s*`, "g"), "$1，")
-    .replace(new RegExp(`([${cjk}])\\.(?!\\d)\\s*`, "g"), "$1。")
-    .replace(new RegExp(`([${cjk}])\\?\\s*`, "g"), "$1？")
-    .replace(new RegExp(`([${cjk}])!\\s*`, "g"), "$1！")
-    .replace(new RegExp(`([${cjk}]);\\s*`, "g"), "$1；")
-    .replace(/\s{2,}/g, " ")
 }
 
 // ---------- 文本模型 ----------
@@ -518,7 +408,10 @@ const SECURITY_HEADERS: Record<string, string> = {
   "Referrer-Policy": "no-referrer",
   "Permissions-Policy": "microphone=(self), camera=(), geolocation=()",
   "Content-Security-Policy":
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; " +
+    // 本机语音识别：运行时（jsDelivr / npmmirror）和模型（ModelScope / Hugging Face / hf-mirror）只在第一次下载
+    "connect-src 'self' https://cdn.jsdelivr.net https://registry.npmmirror.com https://*.npmmirror.com https://modelscope.cn https://*.modelscope.cn https://huggingface.co https://*.huggingface.co https://*.hf.co https://hf-mirror.com; " +
+    "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
 }
 
 function serveStatic(request: Request, url: URL): Response {
@@ -568,9 +461,6 @@ export default {
       switch (path) {
         case "/check":
           return json({ ok: true }, 200, cors)
-        case "/transcribe":
-          await limit(env.RL_ASR, `asr:${ip}`)
-          return json(await transcribe(request, env), 200, cors)
         case "/feedback": {
           const raw = await request.text()
           await limit(env.RL_LLM, `llm:${ip}`)

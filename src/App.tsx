@@ -4,12 +4,14 @@ import type { Material, Sentence } from "./materials"
 import { findSentenceId, getMaterial, materials, splitSentences, transcriptOf } from "./materials"
 import { AccessPanel } from "./AccessPanel"
 import { useAccessCode } from "./access"
-import { ApiError, messageOf, requestFeedback, requestReport, transcribeChunks } from "./api"
+import { ApiError, messageOf, requestFeedback, requestReport } from "./api"
 import type { FeedbackData, ReportData } from "./api"
 import { Duck } from "./duck"
 import { useRecorder } from "./useRecorder"
 import type { StopResult } from "./useRecorder"
-import { decodeBlob, encodeWav, resample, splitPcm } from "./wav"
+import { decodeBlob, resample } from "./wav"
+import { transcribeLocal } from "./asr/engine"
+import { AsrStatusLine, useAsrState } from "./asr/AsrStatus"
 import { TARGET_SAMPLE_RATE } from "./config"
 import {
   Badge,
@@ -102,10 +104,9 @@ function reportKey(materialId: string, attempt: 1 | 2, transcript: string) {
 const feedbackCache = new Map<string, FeedbackData>()
 const reportCache = new Map<string, ReportData>()
 
-/** 解码录音 → 单声道 → 16kHz → ≤25 秒切段 → WAV → 按顺序转写。 */
+/** 解码录音 → 单声道 → 16kHz → 在本机按停顿切段识别（不上传）。 */
 async function transcribeRecording(
   recording: { blob: Blob | null; pcm: Float32Array | null; rate: number },
-  materialId: string,
   onProgress: (done: number, total: number) => void,
 ): Promise<string> {
   let mono: Float32Array | null = null
@@ -127,9 +128,8 @@ async function transcribeRecording(
     if (!rate) rate = 48000
   }
   const resampled = resample(mono, rate, TARGET_SAMPLE_RATE)
-  const chunks = splitPcm(resampled).map((part) => encodeWav(part))
-  if (chunks.length === 0) throw new ApiError("没有录到声音")
-  return transcribeChunks(chunks, materialId, onProgress)
+  if (resampled.length < TARGET_SAMPLE_RATE * 0.3) throw new ApiError("没有录到声音")
+  return transcribeLocal(resampled, onProgress)
 }
 
 export default function App() {
@@ -439,6 +439,8 @@ function Speak({
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
   const [stage, setStage] = useState<"check" | "idle" | "live">(attempt === 1 ? "check" : "idle")
   const cancelled = useRef(false)
+  const asr = useAsrState(true)
+  const asrLoading = asr.status === "downloading" || asr.status === "initializing"
 
   useEffect(() => {
     cancelled.current = false
@@ -478,9 +480,7 @@ function Speak({
       const result: SpeakResult = { url: recordingResult.url, sentences: null, error: null }
       if (recordingResult.blob || (recordingResult.pcm && recordingResult.pcm.length > 0)) {
         try {
-          const text = await transcribeRecording(recordingResult, material.id, (done, total) =>
-            setProgress({ done, total }),
-          )
+          const text = await transcribeRecording(recordingResult, (done, total) => setProgress({ done, total }))
           const sentences = splitSentences(text)
           if (sentences.length === 0) result.error = "识别结果是空的"
           else result.sentences = sentences
@@ -526,7 +526,9 @@ function Speak({
             <p className="speak-status recalling-status" role="status">
               小黄鸭正在回想你说的话…
             </p>
-            {progress && progress.total > 1 ? (
+            {asrLoading ? (
+              <AsrStatusLine state={asr} />
+            ) : progress && progress.total > 1 ? (
               <p className="recall-progress">
                 第 {Math.min(progress.done + 1, progress.total)} / {progress.total} 段
               </p>
@@ -554,6 +556,7 @@ function Speak({
               </button>
             </div>
             {micNote ? <p className="mic-note">{micNote}</p> : null}
+            <AsrStatusLine state={asr} />
           </>
         ) : (
           <>
@@ -591,6 +594,7 @@ function Speak({
               )}
             </div>
             {micNote ? <p className="mic-note">{micNote}</p> : null}
+            <AsrStatusLine state={asr} />
           </>
         )}
       </main>
@@ -602,7 +606,7 @@ function Speak({
 function PrivacyNote() {
   return (
     <p className="privacy-note">
-      录音经我们的服务器交给 Cloudflare 上的语音识别模型转成文字，转完不保存；你点「看看小黄鸭听到了什么」时，逐字稿会发给智谱生成反馈，也不保存。
+      录音不上传：录音和转文字都在你这台设备上完成（第一次会下载约 74 MB 的识别模型，之后存在本机）。只有你点「看看小黄鸭听到了什么」时，逐字稿文字会发给智谱生成反馈，不保存。
     </p>
   )
 }

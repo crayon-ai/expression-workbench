@@ -62,7 +62,7 @@ async function request(path: string, init: RequestInit, timeoutMs: number): Prom
   else if (response.status === 413 || detail === "too_large" || detail === "too_long") kind = "too_large"
   else if (response.status === 429 || detail === "rate_limited") kind = "rate_limited"
   else if (detail === "not_configured") kind = "not_configured"
-  else if (response.status === 503 || detail === "asr_unavailable") kind = "unavailable"
+  else if (response.status === 503) kind = "unavailable"
   else if (response.status === 502 || detail === "upstream") kind = "upstream"
   throw new ApiError(kindMessage(kind, response.status), kind)
 }
@@ -80,7 +80,7 @@ function kindMessage(kind: ApiErrorKind, status: number): string {
     case "rate_limited":
       return "请求太频繁了，等一分钟再试"
     case "unavailable":
-      return "语音识别暂时不可用"
+      return "服务暂时不可用"
     case "not_configured":
       return "小黄鸭的后台还没配置好"
     case "upstream":
@@ -112,33 +112,6 @@ export type FeedbackData = {
   issues: Array<{ quote: string; comment: string }>
   improved: { quote: string; comment: string } | null
   premises: Array<{ id: string; label: string; covered: boolean }>
-}
-
-/** 逐段转写：按顺序送，每段把前面已识别文字的最后 200 字作为 prompt，保持用词连贯。 */
-export async function transcribeChunks(
-  chunks: Blob[],
-  materialId: string,
-  onProgress?: (done: number, total: number) => void,
-): Promise<string> {
-  let text = ""
-  for (let i = 0; i < chunks.length; i++) {
-    onProgress?.(i, chunks.length)
-    const form = new FormData()
-    form.append("file", chunks[i] as Blob, `chunk-${i + 1}.wav`)
-    form.append("prompt", text.slice(-200))
-    form.append("materialId", materialId)
-    const data = await request("/api/transcribe", { method: "POST", body: form }, 45000)
-    const piece =
-      data && typeof data === "object" && typeof (data as { text?: unknown }).text === "string"
-        ? (data as { text: string }).text.trim()
-        : null
-    if (piece === null) throw new ApiError("服务返回的内容缺少 text")
-    // 段与段之间补一个逗号（只补标点，不改字），免得两段话粘在一起
-    if (text && piece && !/[，。！？；、,.!?;…]$/.test(text)) text += "，"
-    text += piece
-  }
-  onProgress?.(chunks.length, chunks.length)
-  return text
 }
 
 export async function requestFeedback(body: {

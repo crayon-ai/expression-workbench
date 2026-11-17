@@ -1318,3 +1318,32 @@ h1 + .lede {
     transform: none;
   }
 }
+
+.asr-note {
+  margin-top: 14px;
+  max-width: 30em;
+  color: var(--ink-tertiary);
+  font-size: 13px;
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+}
+
+.asr-note.is-problem {
+  color: var(--record);
+}
+
+.asr-bar {
+  margin: 6px auto 0;
+  height: 4px;
+  max-width: 260px;
+  border-radius: 2px;
+  background: var(--line, rgba(0, 0, 0, 0.08));
+  overflow: hidden;
+}
+
+.asr-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--ink-secondary, currentColor);
+  transition: width 0.3s ease;
+}
