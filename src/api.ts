@@ -133,6 +133,8 @@ export async function transcribeChunks(
         ? (data as { text: string }).text.trim()
         : null
     if (piece === null) throw new ApiError("服务返回的内容缺少 text")
+    // 段与段之间补一个逗号（只补标点，不改字），免得两段话粘在一起
+    if (text && piece && !/[，。！？；、,.!?;…]$/.test(text)) text += "，"
     text += piece
   }
   onProgress?.(chunks.length, chunks.length)
